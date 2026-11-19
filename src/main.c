@@ -244,6 +244,11 @@ static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_de
                     rvvm_error("Failed to attach image \"%s\"", arg_val);
                     return false;
                 }
+            } else if (rvvm_strcmp(arg_name, "9p")) {
+                if (!rvvm_virtio_9p_init(machine, arg_val, 0)) {
+                    rvvm_error("Failed to share directory \"%s\" via virtio-9p", arg_val);
+                    return false;
+                }
             } else if (rvvm_strcmp(arg_name, "serial")) {
                 chardev_t* chardev = chardev_pty_create(arg_val);
                 if (chardev == NULL && !rvvm_strcmp(arg_val, "null")) {

@@ -510,6 +510,17 @@ static inline bool rvvm_board_riscv_virt_init(rvvm_machine_t* machine, bool aia)
     return true;
 }
 
+
+/**
+ * Attach a virtio-9p device sharing a host directory
+ *
+ * \param machine   Machine handle
+ * \param root_path Host directory to share
+ * \param addr      MMIO address (0 for auto-allocation)
+ * eturn          Region device handle (`NULL` on failure)
+ */
+RVVM_PUBLIC rvvm_reg_dev_t* rvvm_virtio_9p_init(rvvm_machine_t* machine, const char* root_path, rvvm_addr_t addr);
+
 /** @}*/
 
 RVVM_EXTERN_C_END
