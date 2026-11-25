@@ -29,6 +29,7 @@ PUSH_OPTIMIZATION_SIZE
 
 #if defined(HOST_TARGET_EMSCRIPTEN)
 #include "mem_ops.h"
+#include "rvtimer.h" // For sleep_ms()
 #include "threading.h"
 #endif
 
@@ -153,8 +154,13 @@ static void* input_worker(void* arg)
         if (tmp) {
             thread_futex_wait(&input_amount, tmp, -1);
         } else {
-            tmp = read(fd, input_buffer, sizeof(input_buffer));
-            atomic_store_uint32(&input_amount, EVAL_MAX(tmp, 0));
+            int ret = read(fd, input_buffer, sizeof(input_buffer));
+            if (ret > 0) {
+                atomic_store_uint32(&input_amount, ret);
+            } else {
+                // EOF or read error: publish nothing, avoid hot-spinning read()
+                sleep_ms(20);
+            }
         }
     }
     return arg;
