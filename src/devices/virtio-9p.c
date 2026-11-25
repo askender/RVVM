@@ -26,6 +26,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include "mem_ops.h"
 #include "utils.h"
+#include "locking.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -160,12 +161,15 @@ typedef struct {
 
     uint8_t* resp_buf;  /* 9P response scratch */
     uint8_t* req_buf;   /* 9P request scratch */
+    uint8_t* out_buf;   /* 9P request scratch (prealloc: seccomp-safe) */
     uint8_t* walk_buf;
 
     v9p_fid_t* fids;
     size_t     fid_count;
 
     uint16_t last_used_idx;
+
+    rvvm_lock_t lock;      /* Serializes queue_notify across guest harts */
 } v9p_dev_t;
 
 /* ---------- little-endian buffer ops ---------- */
@@ -229,8 +233,14 @@ static void v9p_qid_from_stat(uint8_t* qid, const struct stat* st)
     write_uint64_le(qid + 5, (uint64_t)st->st_ino);
 }
 
+static void v9p_fid_free(v9p_fid_t* f);
+
 static v9p_fid_t* v9p_fid_alloc(v9p_dev_t* p9p, uint32_t fid, char* path, bool is_dir)
 {
+    /* Auto-clunk: a stale slot with the same fid number must not shadow us */
+    for (size_t i = 0; i < p9p->fid_count; ++i) {
+        if (p9p->fids[i].used && p9p->fids[i].fid == fid) v9p_fid_free(&p9p->fids[i]);
+    }
     for (size_t i = 0; i < p9p->fid_count; ++i) {
         if (!p9p->fids[i].used) {
             p9p->fids[i].used   = true;
@@ -317,7 +327,6 @@ static void v9p_resp_begin(v9p_resp_t* r, uint8_t type)
 static void v9p_resp_send(v9p_resp_t* r)
 {
     size_t written = (size_t)(r->out - r->hdr);
-    rvvm_info("v9p: send written=%zu type=%02x", written, r->hdr[4]);
     size_t total   = written; /* 9P size field INCLUDES itself */
     if (total > r->in_len) {
         total = r->in_len;
@@ -327,7 +336,6 @@ static void v9p_resp_send(v9p_resp_t* r)
 
 static void v9p_rlerror(v9p_resp_t* r, uint32_t ecode)
 {
-    rvvm_info("v9p: Rlerror ecode=%u tag=%u", ecode, r->tag);
     v9p_resp_begin(r, P9_RLERROR);
     v9p_put32(&r->out, ecode);
     v9p_resp_send(r);
@@ -340,9 +348,7 @@ static void v9p_handle_version(v9p_dev_t* p9p, v9p_resp_t* r, const uint8_t** in
     UNUSED(p9p);
     uint32_t msize = v9p_get32(in);
     uint16_t slen  = v9p_get16(in);
-    const uint8_t* ver = *in;
-    *in += slen;
-    rvvm_info("v9p: Tversion msize=%u ver='%.*s'", msize, slen, ver);
+    *in += slen; /* Protocol string is echoed, only the length matters for parsing */
     if (msize > V9P_MAX_MSG) msize = V9P_MAX_MSG;
     v9p_resp_begin(r, P9_RVERSION); /* Rversion echoes NOTAG */
     r->tag = P9_NOTAG;
@@ -369,19 +375,16 @@ static void v9p_handle_attach(v9p_dev_t* p9p, v9p_resp_t* r, const uint8_t** in)
     strcpy(root, p9p->root);
     struct stat st;
     if (stat(root, &st) != 0) {
-        rvvm_info("v9p: attach stat failed root='%s' errno=%d", root ? root : "(null)", errno);
         free(root);
         v9p_rlerror(r, ENOENT);
         return;
     }
     v9p_fid_t* f = v9p_fid_alloc(p9p, fid, root, S_ISDIR(st.st_mode));
     if (!f) {
-        rvvm_info("v9p: attach fid_alloc failed");
         free(root);
         v9p_rlerror(r, ENOMEM);
         return;
     }
-    rvvm_info("v9p: attach ok fid=%u root='%s'", fid, root);
     uint8_t qid[13];
     v9p_qid_from_stat(qid, &st);
     v9p_resp_begin(r, P9_RATTACH);
@@ -467,7 +470,6 @@ static void v9p_handle_lopen(v9p_dev_t* p9p, v9p_resp_t* r, const uint8_t** in)
     v9p_fid_close_fd(f);
     f->fd = open(f->path, fl | O_CLOEXEC, 0644);
     if (f->fd < 0) {
-        rvvm_info("v9p: lopen failed path='%s' flags=%o errno=%d", f->path, fl, errno);
         v9p_rlerror(r, errno);
         return;
     }
@@ -542,19 +544,16 @@ static void v9p_handle_getattr(v9p_dev_t* p9p, v9p_resp_t* r, const uint8_t** in
     v9p_fid_t* f = v9p_fid_lookup(p9p, fid);
     struct stat st;
     if (!f) {
-        rvvm_info("v9p: getattr fid=%u not found", fid);
         v9p_rlerror(r, EBADF);
         return;
     }
     if (lstat(f->path, &st) != 0) {
-        rvvm_info("v9p: getattr lstat failed path='%s' errno=%d", f->path, errno);
         v9p_rlerror(r, errno);
         return;
     }
     uint8_t qid[13];
     v9p_qid_from_stat(qid, &st);
     uint64_t valid = mask & 0x3FF;
-    rvvm_info("v9p: getattr ok fid=%u path=%s size=%lu", fid, f->path, (unsigned long)st.st_size);
     v9p_resp_begin(r, P9_RGETATTR);
     v9p_put64(&r->out, valid);
     memcpy(r->out, qid, 13);
@@ -676,11 +675,10 @@ static void v9p_handle_read(v9p_dev_t* p9p, v9p_resp_t* r, const uint8_t** in)
         v9p_rlerror(r, EBADF);
         return;
     }
-    if (count > r->in_len - 64) count = r->in_len - 64;
+    if (r->in_len >= 11 && count > r->in_len - 11) count = r->in_len - 11; /* resp = Rread hdr(11) + data */
     v9p_resp_begin(r, P9_RREAD);
     v9p_put32(&r->out, 0); /* placeholder for count */
     ssize_t rd = pread(f->fd, r->out, count, (off_t)offset);
-    rvvm_info("v9p: read fd=%d count=%u offset=%lu rd=%ld", f->fd, count, (unsigned long)offset, (long)rd);
     if (rd < 0) {
         rd = 0;
     }
@@ -742,6 +740,9 @@ static bool v9p_desc_read(v9p_dev_t* p9p, uint16_t idx, vring_desc_t* desc)
 
 static void v9p_queue_notify(v9p_dev_t* p9p)
 {
+    /* Multiple guest harts may notify concurrently; the shared scratch
+     * buffers and the fid table are not safe for concurrent use. */
+    rvvm_scoped_spin_lock(&p9p->lock);
     if (!p9p->queue_ready || p9p->queue_num == 0) return;
 
     while (true) {
@@ -753,16 +754,10 @@ static void v9p_queue_notify(v9p_dev_t* p9p)
         if (!rvvm_read_ram(p9p->machine, &entry_idx, p9p->avail_addr + 4 + (p9p->last_used_idx % p9p->queue_num) * 2, 2)) break;
 
         /* Walk the descriptor chain: leading out buffers + trailing in buffer */
-        uint8_t* out_buf = malloc(V9P_MAX_MSG);
-        uint8_t* resp_buf = malloc(V9P_MAX_MSG);
-        if (!out_buf || !resp_buf) {
-            free(out_buf);
-            free(resp_buf);
-            break;
-        }
+        uint8_t* out_buf  = p9p->out_buf;
+        uint8_t* resp_buf = p9p->resp_buf;
         size_t   out_len = 0;
         size_t   in_cap  = 0;
-        uint64_t in_addr = 0;
         uint16_t head    = entry_idx;
         uint16_t d       = head;
         vring_desc_t vd;
@@ -772,11 +767,9 @@ static void v9p_queue_notify(v9p_dev_t* p9p)
                 ok = false;
                 break;
             }
-            rvvm_info("v9p: desc[%u] addr=%llx len=%u flags=%x next=%u", d, (unsigned long long)vd.addr, vd.len, vd.flags, vd.next);
             if (vd.flags & VRING_DESC_F_WRITE) {
                 /* First write descriptor: guest response buffer */
-                in_addr = vd.addr;
-                in_cap  = vd.len;
+                in_cap = vd.len;
                 break;
             }
             if (out_len + vd.len > V9P_MAX_MSG) {
@@ -795,9 +788,30 @@ static void v9p_queue_notify(v9p_dev_t* p9p)
             }
         }
         if (!ok || in_cap < 11) { /* Minimum response: size+type+tag+small payload */
-            free(out_buf);
-            free(resp_buf);
             break;
+        }
+
+        /* Record every write descriptor: the 9pnet zerocopy layout splits
+         * the response area into a short header desc plus data page descs. */
+        size_t   in_offs[64];
+        size_t   in_lens[64];
+        uint32_t in_cnt = 0;
+        in_cap = 0; /* true capacity = sum of all WRITE descs (walk loop preset first only) */
+        {
+            uint16_t wd = head;
+            for (uint32_t g2 = 0; g2 < VMM_QUEUE_MAX_NUM; ++g2) {
+                if (!v9p_desc_read(p9p, wd, &vd)) break;
+                if (vd.flags & VRING_DESC_F_WRITE) {
+                    if (in_cnt < 64) {
+                        in_offs[in_cnt] = vd.addr;
+                        in_lens[in_cnt] = vd.len;
+                        in_cnt++;
+                    }
+                    in_cap += vd.len;
+                }
+                if (!(vd.flags & VRING_DESC_F_NEXT)) break;
+                wd = vd.next;
+            }
         }
 
         /* Parse the 9P request: size[4] type[1] tag[2] */
@@ -848,13 +862,10 @@ static void v9p_queue_notify(v9p_dev_t* p9p)
                 break;
             case P9_TCLUNK: {
                 uint32_t fid = v9p_get32(&in);
-                rvvm_info("v9p: Tclunk fid=%u", fid);
                 v9p_fid_t* f = v9p_fid_lookup(p9p, fid);
                 if (f) v9p_fid_free(f);
-                rvvm_info("v9p: Tclunk freed");
                 v9p_resp_begin(&r, P9_RCLUNK);
                 v9p_resp_send(&r);
-                rvvm_info("v9p: Tclunk resp sent");
                 break;
             }
             case P9_TFLUSH:
@@ -869,39 +880,27 @@ static void v9p_queue_notify(v9p_dev_t* p9p)
         /* Copy the response into the guest in buffer, then write the used ring */
         size_t resp_len = read_uint32_le(resp_buf); /* size field includes itself */
         if (resp_len > in_cap) resp_len = in_cap;
-        rvvm_info("v9p: resp len=%zu bytes=%ph", resp_len, (const void*)resp_buf);
-        rvvm_write_ram(p9p->machine, in_addr, resp_buf, resp_len);
+        {
+            size_t copied = 0;
+            for (uint32_t wi = 0; wi < in_cnt && copied < resp_len; ++wi) {
+                size_t n = in_lens[wi] < (resp_len - copied) ? in_lens[wi] : (resp_len - copied);
+                if (n) rvvm_write_ram(p9p->machine, in_offs[wi], resp_buf + copied, n);
+                copied += n;
+            }
+        }
 
         uint64_t used_entry = p9p->used_addr + 4 + (p9p->last_used_idx % p9p->queue_num) * 8;
         uint8_t  ue[8];
         write_uint32_le(ue, head);
         write_uint32_le(ue + 4, (uint32_t)resp_len);
-        bool w_ok = rvvm_write_ram(p9p->machine, used_entry, ue, 8);
-        rvvm_info("v9p: resp hex %02x %02x %02x %02x %02x %02x %02x %02x | used ok=%d idx=%u head=%u len=%u",
-                  resp_buf[0], resp_buf[1], resp_buf[2], resp_buf[3], resp_buf[4], resp_buf[5], resp_buf[6], resp_buf[7],
-                  (int)w_ok, p9p->last_used_idx, head, (uint32_t)resp_len);
+        rvvm_write_ram(p9p->machine, used_entry, ue, 8);
         p9p->last_used_idx++;
         uint16_t ui = p9p->last_used_idx;
         rvvm_write_ram(p9p->machine, p9p->used_addr + 2, &ui, 2);
 
         /* Raise the interrupt (guest ACK clears it) */
-        {
-            uint8_t echo[16], ue2[16];
-            memset(echo, 0xEE, sizeof(echo));
-            memset(ue2, 0xDD, sizeof(ue2));
-            rvvm_read_ram(p9p->machine, echo, in_addr, 12);
-            rvvm_read_ram(p9p->machine, ue2, p9p->used_addr, 8);
-            rvvm_info("v9p: guest echo %x %x %x %x %x %x %x %x %x %x %x %x",
-                      echo[0], echo[1], echo[2], echo[3], echo[4], echo[5], echo[6], echo[7],
-                      echo[8], echo[9], echo[10], echo[11]);
-            rvvm_info("v9p: used ring %x %x %x %x %x %x %x %x",
-                      ue2[0], ue2[1], ue2[2], ue2[3], ue2[4], ue2[5], ue2[6], ue2[7]);
-        }
         p9p->irq_status |= VIRTIO_IRQ_USED_RING;
         rvvm_irq_raise(p9p->irq_dev, p9p->irq);
-
-        free(out_buf);
-        free(resp_buf);
     }
 }
 
@@ -918,7 +917,7 @@ static uint32_t v9p_mmio_read_reg(v9p_dev_t* p9p, size_t off)
         case VMM_QUEUE_NUM_MAX: return VMM_QUEUE_MAX_NUM;
         case VMM_QUEUE_READY:   return p9p->queue_ready ? 1 : 0;
         case VMM_IRQ_STATUS:    return p9p->irq_status;
-        case VMM_STATUS:        rvvm_info("v9p: status read 0x%x (size handled by caller)", p9p->status); return p9p->status;
+        case VMM_STATUS:        return p9p->status;
         case VMM_CFG_GEN:       return 0;
         default:                return 0;
     }
@@ -948,7 +947,7 @@ static void v9p_mmio_write_reg(v9p_dev_t* p9p, size_t off, uint32_t val)
             p9p->irq_status &= ~val;
             if (!(p9p->irq_status & VIRTIO_IRQ_USED_RING)) rvvm_irq_lower(p9p->irq_dev, p9p->irq);
             break;
-        case VMM_STATUS: p9p->status = (uint8_t)val; rvvm_info("v9p: status write 0x%x", val); break;
+        case VMM_STATUS: p9p->status = (uint8_t)val; break;
     }
 }
 
@@ -978,7 +977,6 @@ static void v9p_mmio_write(rvvm_reg_dev_t* dev, const void* data, size_t size, s
     for (size_t i = 0; i < size && i < 4; ++i) {
         val |= ((uint32_t)read_uint8((const uint8_t*)data + i)) << (8 * i);
     }
-    rvvm_info("v9p: write off=0x%x val=0x%x size=%u", (uint32_t)off, val, (uint32_t)size);
     if (off >= VMM_CFG) return; /* Config is read-only */
     v9p_mmio_write_reg(p9p, off, val);
 }
@@ -1003,6 +1001,7 @@ static void v9p_mmio_cleanup(rvvm_reg_dev_t* dev)
     free(p9p->fids);
     free(p9p->resp_buf);
     free(p9p->req_buf);
+    free(p9p->out_buf);
     free(p9p->walk_buf);
     free(p9p->root);
     free(p9p);
@@ -1033,11 +1032,13 @@ RVVM_PUBLIC rvvm_reg_dev_t* rvvm_virtio_9p_init(rvvm_machine_t* machine, const c
     p9p->root    = malloc(strlen(root_path) + 1);
     p9p->resp_buf = malloc(V9P_MAX_MSG);
     p9p->req_buf  = malloc(V9P_MAX_MSG);
+    p9p->out_buf  = malloc(V9P_MAX_MSG);
     p9p->walk_buf = malloc(256 * 13);
-    if (!p9p->root || !p9p->resp_buf || !p9p->req_buf || !p9p->walk_buf) {
+    if (!p9p->root || !p9p->resp_buf || !p9p->req_buf || !p9p->out_buf || !p9p->walk_buf) {
         free(p9p->root);
         free(p9p->resp_buf);
         free(p9p->req_buf);
+        free(p9p->out_buf);
         free(p9p->walk_buf);
         free(p9p);
         return NULL;
@@ -1062,7 +1063,6 @@ RVVM_PUBLIC rvvm_reg_dev_t* rvvm_virtio_9p_init(rvvm_machine_t* machine, const c
 
     p9p->irq_dev = rvvm_get_intc(machine);
     p9p->irq     = rvvm_irq_alloc(p9p->irq_dev, VMM_IRQ_BASE);
-    rvvm_info("virtio-9p: irq line = %u", (uint32_t)p9p->irq);
 
     /* Device tree: virtio,mmio node */
     rvvm_fdt_node_t* soc = rvvm_get_fdt_soc(machine);
