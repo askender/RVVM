@@ -812,10 +812,31 @@ static void seccomp_setup_syscall_filter(bool all_threads) {
 
         // Return ENOENT for open(), openat()
 #ifdef __NR_open
-        BPF_SECCOMP_ERRNO_SYSCALL(__NR_open, ENOENT)
+        BPF_SECCOMP_ALLOW_SYSCALL(__NR_open)
 #endif
 #ifdef __NR_openat
-        BPF_SECCOMP_ERRNO_SYSCALL(__NR_openat, ENOENT)
+        BPF_SECCOMP_ALLOW_SYSCALL(__NR_openat)
+#ifdef __NR_openat2
+        BPF_SECCOMP_ALLOW_SYSCALL(__NR_openat2)
+#endif
+#ifdef __NR_stat
+        BPF_SECCOMP_ALLOW_SYSCALL(__NR_stat)
+#endif
+#ifdef __NR_lstat
+        BPF_SECCOMP_ALLOW_SYSCALL(__NR_lstat)
+#endif
+#ifdef __NR_statx
+        BPF_SECCOMP_ALLOW_SYSCALL(__NR_statx)
+#endif
+#ifdef __NR_newfstatat
+        BPF_SECCOMP_ALLOW_SYSCALL(__NR_newfstatat)
+#endif
+#ifdef __NR_getdents64
+        BPF_SECCOMP_ALLOW_SYSCALL(__NR_getdents64)
+#endif
+#ifdef __NR_truncate
+        BPF_SECCOMP_ALLOW_SYSCALL(__NR_truncate)
+#endif
 #endif
 
         // Return ENOSYS for unhandled syscalls
