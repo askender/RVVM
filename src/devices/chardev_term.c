@@ -187,25 +187,39 @@ static uint32_t term_update_flags(chardev_term_t* term);
 
 /* A single keyboard event never exceeds 8 bytes (UTF-8 or an escape sequence),
  * so the bytes are passed as plain ints: no heap access needed on the caller side. */
-EMSCRIPTEN_KEEPALIVE void rvvm_wasm_serial_input(int len, int b0, int b1, int b2, int b3, //
-                                                 int b4, int b5, int b6, int b7)
+EMSCRIPTEN_KEEPALIVE int rvvm_wasm_serial_input(int len, int b0, int b1, int b2, int b3, //
+                                                int b4, int b5, int b6, int b7)
 {
     char   data[8];
     int    bytes[8] = {b0, b1, b2, b3, b4, b5, b6, b7};
     chardev_term_t* term = em_kb_term;
-    if (!term || len <= 0 || len > 8) return;
+    if (!term || len <= 0 || len > 8) return -1;
     for (int i = 0; i < len; ++i) {
         data[i] = bytes[i] & 0xFF;
     }
     uint32_t flags = 0;
+    int delivered = 0;
     scoped_spin_try_lock (&term->lock) {
         ringbuf_write(&term->rx, data, len);
         term_process_input(term, data, len);
         flags = term_update_flags(term);
+        delivered = 1;
     }
     if (flags) {
         chardev_notify(&term->chardev, flags);
     }
+    return delivered;
+}
+
+/* Opt in to reading real stdin for the first terminal (Node embedders):
+ * never enabled by default, see the comment in term_read_raw(). */
+EMSCRIPTEN_KEEPALIVE void rvvm_wasm_stdin_enable(int enable)
+{
+    static bool spawned = false;
+    chardev_term_t* term = em_kb_term;
+    if (!enable || !term || spawned) return;
+    spawned = true;
+    thread_create(input_worker, (void*)(size_t)term->rfd);
 }
 
 #endif
@@ -215,15 +229,12 @@ static size_t term_read_raw(chardev_term_t* term, char* buffer, size_t size)
     UNUSED(term && buffer && size);
 #if defined(HOST_TARGET_EMSCRIPTEN)
     DO_ONCE_SCOPED {
-        em_kb_term = term;
         // First terminal receives the browser keyboard via rvvm_wasm_serial_input().
-        // Only spawn the stdin worker where a real stdin exists: in a browser,
-        // read(0) hits the Emscripten TTY fallback which pops up window.prompt()
-        // dialogs (repeatedly, from this worker loop).
-        static const char web_check[] = "typeof window != 'undefined' && typeof window.prompt == 'function' ? 1 : 0";
-        if (!emscripten_run_script_int(web_check)) {
-            thread_create(input_worker, (void*)(size_t)term->rfd);
-        }
+        // The stdin worker is NOT auto-spawned: in a browser, read(0) here is
+        // proxied to the main thread where it hits the Emscripten TTY fallback
+        // and pops up window.prompt() dialogs. Embedders with a real stdin
+        // (Node) can opt in via rvvm_wasm_stdin_enable().
+        em_kb_term = term;
     }
     uint32_t ret = EVAL_MIN(atomic_load_uint32(&input_amount), size);
     if (ret) {
