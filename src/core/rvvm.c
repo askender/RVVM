@@ -381,26 +381,9 @@ static bool rvvm_eventloop_tick(bool manual)
     return ret;
 }
 
-#if defined(HOST_TARGET_EMSCRIPTEN)
-
-// Implement proper Emscripten eventloop instead of a built-in one
-#include <emscripten.h>
-
-static void rvvm_eventloop_tick_em(void)
-{
-    rvvm_eventloop_tick(true);
-}
-
-#endif
-
 static void* rvvm_eventloop(void* manual)
 {
     bool running = true;
-#if defined(HOST_TARGET_EMSCRIPTEN)
-    if (manual) {
-        emscripten_set_main_loop(rvvm_eventloop_tick_em, 0, running);
-    }
-#else
     uint32_t    delay = 1000000000ULL / 60;
     rvtimer_t   timer = ZERO_INIT;
     rvtimecmp_t cmp   = ZERO_INIT;
@@ -427,21 +410,11 @@ static void* rvvm_eventloop(void* manual)
             }
         }
     }
-#endif
     return NULL;
 }
 
 static void rvvm_reconfigure_eventloop(void)
 {
-#if defined(HOST_TARGET_EMSCRIPTEN)
-    scoped_spin_lock (&eventloop_lock) {
-        eventloop_thread = NULL;
-        emscripten_cancel_main_loop();
-        if (!global_manual) {
-            emscripten_set_main_loop(rvvm_eventloop_tick_em, 0, false);
-        }
-    }
-#else
     bool needs_cond   = false;
     bool needs_thread = false;
     scoped_spin_lock (&global_lock) {
@@ -465,7 +438,6 @@ static void rvvm_reconfigure_eventloop(void)
             eventloop_thread = thread_create(rvvm_eventloop, NULL);
         }
     }
-#endif
 }
 
 static void rvvm_set_manual_eventloop(bool manual)
