@@ -505,10 +505,13 @@ ifeq ($(OS),emscripten)
 override BIN_EXT := .mjs
 override CFLAGS  := -pthread -s SUPPORT_LONGJMP=0 $(CFLAGS)
 override LDFLAGS := -s DEFAULT_TO_CXX=0 -s BINARYEN_IGNORE_IMPLICIT_TRAPS=1 -s ALLOW_MEMORY_GROWTH=1 \
--s MEMORY_GROWTH_LINEAR_STEP=1mb -s PROXY_TO_PTHREAD=1 -s FORCE_FILESYSTEM=1 -s FETCH=1 $(LDFLAGS)
-# Disable shared library & network by default
+-s MEMORY_GROWTH_LINEAR_STEP=1mb -s PROXY_TO_PTHREAD=1 -s FORCE_FILESYSTEM=1 -s FETCH=1 \
+-s EXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32 --js-library src/util/netjslib.js $(LDFLAGS)
+# WASM builds use the SAB/WebSocket networking backend
+override SRC_USE_NET := $(SRCDIR)/util/net_wasm.c $(SRCDIR)/devices/tap_user.c
+# Network enabled: guest traffic rides a WebSocket relay
 USE_LIB ?= 0
-USE_NET ?= 0
+USE_NET ?= 1
 endif
 
 # Disable pkg-config if it's a cross-compile target and neither PKG_CONFIG_LIBDIR or PKG_CONFIG_SYSROOT_DIR are set, pass -static if needed
@@ -746,6 +749,11 @@ override LIBS_PKG := $(sort $(filter-out $(LIB_BASE_LIST),$(LIBS_ON)))
 override LIBS_OUT := $(if $(LIBS_PKG),$(call shell_ex,$(PKG_CONFIG) $(LIBS_PKG) --cflags --libs $(NULL_STDERR)))
 override LIBS_ERR := $(strip $(if $(LIBS_PKG),$(if $(LIBS_OUT),,$(foreach lib,$(LIBS_PKG),$(if $(call shell_ex,$(PKG_CONFIG) $(lib) --cflags --libs $(NULL_STDERR)),,$(lib))))))
 override LIBS_OUT := $(strip $(if $(LIBS_PKG),$(if $(LIBS_OUT),$(LIBS_OUT),$(foreach lib,$(LIBS_PKG),$(call shell_ex,$(PKG_CONFIG) $(lib) --cflags --libs $(NULL_STDERR))))))
+
+# Emscripten: native networking.c is replaced by the WebSocket transport
+ifeq ($(OS),emscripten)
+override SRC_OFF := $(SRC_OFF) $(SRCDIR)/util/networking.c
+endif
 override CPPFLAGS := $(CPPFLAGS) $(patsubst -I%,$(if $(call gnuc_min_ver,3),-isystem%,-I%),$(filter-out $(filter-out -I% -isystem%,$(filter -%,$(LIBS_OUT))),$(LIBS_OUT)))
 
 $(if $(LIBS_ERR),$(call log_warn,Missing pkg-config metadata for libraries: $(LIBS_ERR)))
