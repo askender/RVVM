@@ -71,6 +71,7 @@ static struct {
         uint32_t state;     // 0 idle, 1 pending, 2 done, 3 fail
         uint32_t ip;        // spoofed source (queried server)
         uint16_t port;
+        uint16_t sock_id;   // owning UDP sock: responses deliver only to it
         uint32_t qlen;
         uint32_t rlen;
         uint8_t  q[512];
@@ -279,6 +280,7 @@ size_t net_udp_send(net_sock_t* sock, const void* buffer, size_t size, const net
         g_ns.dns[slot].ip = ((uint32_t)addr->ip[0] << 24) | ((uint32_t)addr->ip[1] << 16) |
                             ((uint32_t)addr->ip[2] << 8) | (uint32_t)addr->ip[3];
         g_ns.dns[slot].port = addr->port;
+        g_ns.dns[slot].sock_id = sock->id;
         g_ns.dns[slot].state = 1; // pending
         netjs_dns_submit();
         return size;
@@ -308,9 +310,11 @@ static int32_t ns_udp_pop(net_sock_t* sock, void* buffer, size_t size, net_addr_
 int32_t net_udp_recv(net_sock_t* sock, void* buffer, size_t size, net_addr_t* addr)
 {
     if (!sock || sock->kind != NS_KIND_UDP) return NET_ERR_UNKNOWN;
-    // Deliver completed DoH responses first
+    // Deliver completed DoH responses to their owning sock only
+    // (busybox sends A+AAAA in parallel on two source ports; a global mailbox
+    // would cross-deliver and the guest resolver drops mismatched txids)
     for (uint32_t i = 0; i < 2; ++i) {
-        if (g_ns.dns[i].state == 2 && g_ns.dns[i].rlen) {
+        if (g_ns.dns[i].state == 2 && g_ns.dns[i].rlen && g_ns.dns[i].sock_id == sock->id) {
             uint32_t len = (uint32_t)EVAL_MIN(size, g_ns.dns[i].rlen);
             memcpy(buffer, g_ns.dns[i].r, len);
             memset(addr, 0, sizeof(net_addr_t));
@@ -459,7 +463,7 @@ static uint32_t ns_poll_flags(struct net_sock* s)
         if (s->state == NS_ST_RESET) flags |= NET_POLL_RECV;
     } else if (s->kind == NS_KIND_UDP) {
         for (uint32_t i = 0; i < 2; ++i) {
-            if (g_ns.dns[i].state == 2 && g_ns.dns[i].rlen) flags |= NET_POLL_RECV;
+            if (g_ns.dns[i].state == 2 && g_ns.dns[i].rlen && g_ns.dns[i].sock_id == s->id) flags |= NET_POLL_RECV;
         }
         uint32_t used = (s->dg_head - s->dg_tail) & 7;
         if (used) flags |= NET_POLL_RECV;
