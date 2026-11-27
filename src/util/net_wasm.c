@@ -167,6 +167,7 @@ net_sock_t* net_tcp_connect(const net_addr_t* dst, const net_addr_t* src, bool b
     s->addr = *dst;
     s->kind = NS_KIND_TCP;
     s->state = NS_ST_CONNECTING;
+    if (g_ns.sock_cnt <= s->id + 1) g_ns.sock_cnt = s->id + 1;
     // The embedder pump opens the relay WebSocket when it sees CONNECTING;
     // bump wake so its poll notices the new connection early.
     atomic_store_uint32(&g_ns.wake, atomic_load_uint32(&g_ns.wake) + 1);
@@ -257,6 +258,7 @@ net_sock_t* net_udp_bind(const net_addr_t* addr)
     s->addr = *addr;
     s->kind = NS_KIND_UDP;
     s->state = NS_ST_UDP;
+    if (g_ns.sock_cnt <= s->id + 1) g_ns.sock_cnt = s->id + 1;
     return s;
 }
 
@@ -337,6 +339,7 @@ net_sock_t* net_icmp_bind(const net_addr_t* addr)
     s->addr = *addr;
     s->kind = NS_KIND_ICMP;
     s->state = NS_ST_UDP;
+    if (g_ns.sock_cnt <= s->id + 1) g_ns.sock_cnt = s->id + 1;
     return s;
 }
 

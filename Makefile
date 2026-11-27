@@ -504,9 +504,17 @@ endif
 ifeq ($(OS),emscripten)
 override BIN_EXT := .mjs
 override CFLAGS  := -pthread -s SUPPORT_LONGJMP=0 $(CFLAGS)
+# _main must stay exported: emscripten probes the exported main to decide
+# MAIN_READS_PARAMS; without it callMain passes argc=0/argv=NULL and RVVM
+# prints usage & exits with zero serial output (the "intermittent no-boot" bug)
+# Firmware preload: point FW_PRELOAD at a firmware image to embed the fetch+FS_createDataFile wiring
+FW_PRELOAD ?=
+ifneq ($(FW_PRELOAD),)
+override FW_PRELOAD_ARGS := --preload-file $(FW_PRELOAD)@/fw_payload.bin
+endif
 override LDFLAGS := -s DEFAULT_TO_CXX=0 -s BINARYEN_IGNORE_IMPLICIT_TRAPS=1 -s ALLOW_MEMORY_GROWTH=1 \
--s MEMORY_GROWTH_LINEAR_STEP=1mb -s PROXY_TO_PTHREAD=1 -s FORCE_FILESYSTEM=1 -s FETCH=1 \
--s EXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32 --js-library src/util/netjslib.js $(LDFLAGS)
+-s INITIAL_MEMORY=1073741824 -s PROXY_TO_PTHREAD=1 -s FORCE_FILESYSTEM=1 -s FETCH=1 \
+-s EXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32 -s EXPORTED_FUNCTIONS=_main,_rvvm_wasm_serial_input,_rvvm_wasm_stdin_enable,_rvvm_net_shm,_rvvm_net_stride,_rvvm_net_off --js-library src/util/netjslib.js $(FW_PRELOAD_ARGS) $(LDFLAGS)
 # WASM builds use the SAB/WebSocket networking backend
 override SRC_USE_NET := $(SRCDIR)/util/net_wasm.c $(SRCDIR)/devices/tap_user.c
 # Network enabled: guest traffic rides a WebSocket relay
